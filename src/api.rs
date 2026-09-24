@@ -141,10 +141,8 @@ fn has_nonempty_authority(target_url: &str, scheme: &str) -> bool {
     let Some(remainder) = remainder.strip_prefix("//") else {
         return false;
     };
-    !remainder
-        .split(['/', '?', '#'])
-        .next()
-        .is_none_or(str::is_empty)
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty() && !authority.bytes().any(|byte| byte.is_ascii_control())
 }
 
 async fn get_delivery(
