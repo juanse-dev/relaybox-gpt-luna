@@ -93,7 +93,10 @@ async fn enqueue(
         );
     };
     match Url::parse(&target_url) {
-        Ok(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => (),
+        Ok(url)
+            if matches!(url.scheme(), "http" | "https")
+                && url.host().is_some()
+                && has_nonempty_authority(&target_url) => {}
         _ => {
             return error(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -126,6 +129,16 @@ async fn enqueue(
             )
         }
     }
+}
+
+fn has_nonempty_authority(target_url: &str) -> bool {
+    let Some((_, remainder)) = target_url.split_once("://") else {
+        return false;
+    };
+    !remainder
+        .split(['/', '?', '#'])
+        .next()
+        .is_none_or(str::is_empty)
 }
 
 async fn get_delivery(
