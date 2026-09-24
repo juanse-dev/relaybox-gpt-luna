@@ -29,3 +29,25 @@ fn configured(name: &str, default: &str) -> Result<String, VarError> {
         Err(error) => Err(error),
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{env, ffi::OsString, os::unix::ffi::OsStringExt};
+
+    use super::configured;
+
+    #[test]
+    fn non_unicode_database_url_fails_configuration() {
+        const NAME: &str = "RELAYBOX_DATABASE_URL";
+        let previous = env::var_os(NAME);
+        env::set_var(NAME, OsString::from_vec(vec![0xff]));
+
+        let result = configured(NAME, "sqlite://fallback.db");
+
+        match previous {
+            Some(value) => env::set_var(NAME, value),
+            None => env::remove_var(NAME),
+        }
+        assert!(matches!(result, Err(env::VarError::NotUnicode(_))));
+    }
+}
