@@ -19,11 +19,3 @@ pub struct NewDelivery {
     pub target_url: String,
     pub payload: Value,
 }
-
-#[derive(Debug, thiserror::Error)]
-pub enum RepositoryError {
-    #[error("idempotency conflict")]
-    Conflict,
-    #[error("repository failure: {0}")]
-    Failure(#[from] sqlx::Error),
-}

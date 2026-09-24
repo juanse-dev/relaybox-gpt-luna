@@ -1,24 +1,18 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    body::Bytes,
+    extract::{rejection::PathRejection, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
 use url::Url;
 use uuid::Uuid;
 
-use crate::{application::DeliveryService, domain::RepositoryError};
-
-#[derive(Deserialize)]
-struct EnqueueRequest {
-    target_url: String,
-    payload: Value,
-}
+use crate::application::{ApplicationError, DeliveryService};
 
 pub fn router(service: Arc<DeliveryService>) -> Router {
     Router::new()
@@ -35,7 +29,7 @@ async fn health() -> Json<Value> {
 async fn enqueue(
     State(service): State<Arc<DeliveryService>>,
     headers: HeaderMap,
-    body: Result<Json<EnqueueRequest>, axum::extract::rejection::JsonRejection>,
+    body: Bytes,
 ) -> Response {
     let key = match headers.get("Idempotency-Key").and_then(|v| v.to_str().ok()) {
         Some(value) => value.trim_matches(|c: char| c.is_ascii_whitespace()),
@@ -54,8 +48,8 @@ async fn enqueue(
             "Idempotency-Key must be 1 to 128 bytes after trimming",
         );
     }
-    let request = match body {
-        Ok(Json(request)) => request,
+    let request: Value = match serde_json::from_slice(&body) {
+        Ok(request) => request,
         Err(_) => {
             return error(
                 StatusCode::BAD_REQUEST,
@@ -64,7 +58,21 @@ async fn enqueue(
             )
         }
     };
-    match Url::parse(&request.target_url) {
+    let Some(target_url) = request.get("target_url").and_then(Value::as_str) else {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_target_url",
+            "target_url must be an absolute HTTP or HTTPS URL with a host",
+        );
+    };
+    let Some(payload) = request.get("payload") else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "payload is required",
+        );
+    };
+    match Url::parse(target_url) {
         Ok(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => (),
         _ => {
             return error(
@@ -75,7 +83,7 @@ async fn enqueue(
         }
     }
     match service
-        .enqueue(key.to_owned(), request.target_url, request.payload)
+        .enqueue(key.to_owned(), target_url.to_owned(), payload.clone())
         .await
     {
         Ok((delivery, created)) => (
@@ -87,13 +95,13 @@ async fn enqueue(
             Json(delivery),
         )
             .into_response(),
-        Err(RepositoryError::Conflict) => error(
+        Err(ApplicationError::Conflict) => error(
             StatusCode::CONFLICT,
             "idempotency_conflict",
             "Idempotency-Key was already used with different content",
         ),
-        Err(RepositoryError::Failure(e)) => {
-            tracing::error!(error = %e, "delivery persistence failed");
+        Err(ApplicationError::Persistence(detail)) => {
+            tracing::error!(%detail, "delivery persistence failed");
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -105,8 +113,18 @@ async fn enqueue(
 
 async fn get_delivery(
     State(service): State<Arc<DeliveryService>>,
-    Path(id): Path<String>,
+    path: Result<Path<String>, PathRejection>,
 ) -> Response {
+    let Path(id) = match path {
+        Ok(path) => path,
+        Err(_) => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "delivery_not_found",
+                "Delivery not found",
+            )
+        }
+    };
     let id = match Uuid::parse_str(&id) {
         Ok(id) => id,
         Err(_) => {
@@ -124,15 +142,15 @@ async fn get_delivery(
             "delivery_not_found",
             "Delivery not found",
         ),
-        Err(RepositoryError::Failure(e)) => {
-            tracing::error!(error = %e, "delivery query failed");
+        Err(ApplicationError::Persistence(detail)) => {
+            tracing::error!(%detail, "delivery query failed");
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 "An internal error occurred",
             )
         }
-        Err(RepositoryError::Conflict) => error(
+        Err(ApplicationError::Conflict) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
             "An internal error occurred",

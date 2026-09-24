@@ -5,8 +5,8 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::{
-    application::DeliveryRepository,
-    domain::{Delivery, NewDelivery, RepositoryError},
+    application::{ApplicationError, DeliveryRepository, EnqueueOutcome},
+    domain::{Delivery, NewDelivery},
 };
 
 pub struct SqliteDeliveryRepository {
@@ -27,42 +27,41 @@ impl SqliteDeliveryRepository {
 
 #[async_trait]
 impl DeliveryRepository for SqliteDeliveryRepository {
-    async fn enqueue(&self, new: NewDelivery) -> Result<(Delivery, bool), RepositoryError> {
+    async fn enqueue(&self, new: NewDelivery) -> Result<EnqueueOutcome, ApplicationError> {
         let id = Uuid::new_v4();
         let created_at = Utc::now();
-        let payload =
-            serde_json::to_string(&new.payload).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+        let payload = serde_json::to_string(&new.payload)
+            .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
         let result = sqlx::query("INSERT INTO deliveries (id, idempotency_key, status, attempts, target_url, payload, created_at) VALUES (?, ?, 'pending', 0, ?, ?, ?)")
             .bind(id.to_string()).bind(&new.idempotency_key).bind(&new.target_url).bind(payload).bind(created_at.to_rfc3339())
             .execute(&self.pool).await;
         match result {
-            Ok(_) => Ok((
-                Delivery {
-                    id,
-                    status: "pending".into(),
-                    attempts: 0,
-                    target_url: new.target_url,
-                    payload: new.payload,
-                    created_at,
-                },
-                true,
-            )),
-            Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
-                let existing = self.by_key(&new.idempotency_key).await?;
-                if existing.target_url == new.target_url && existing.payload == new.payload {
-                    Ok((existing, false))
-                } else {
-                    Err(RepositoryError::Conflict)
-                }
-            }
-            Err(error) => Err(error.into()),
+            Ok(_) => Ok(EnqueueOutcome::Inserted(Delivery {
+                id,
+                status: "pending".into(),
+                attempts: 0,
+                target_url: new.target_url,
+                payload: new.payload,
+                created_at,
+            })),
+            Err(sqlx::Error::Database(error)) if error.is_unique_violation() => self
+                .by_key(&new.idempotency_key)
+                .await
+                .map(EnqueueOutcome::Existing)
+                .map_err(|error| ApplicationError::Persistence(error.to_string())),
+            Err(error) => Err(ApplicationError::Persistence(error.to_string())),
         }
     }
 
-    async fn get(&self, id: Uuid) -> Result<Option<Delivery>, RepositoryError> {
+    async fn get(&self, id: Uuid) -> Result<Option<Delivery>, ApplicationError> {
         let row = sqlx::query("SELECT id, status, attempts, target_url, payload, created_at FROM deliveries WHERE id = ?")
-            .bind(id.to_string()).fetch_optional(&self.pool).await?;
-        row.map(decode).transpose().map_err(Into::into)
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
+        row.map(decode)
+            .transpose()
+            .map_err(|error| ApplicationError::Persistence(error.to_string()))
     }
 }
 

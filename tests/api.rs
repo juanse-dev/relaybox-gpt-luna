@@ -4,17 +4,25 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    SqlitePool,
+};
+use std::str::FromStr;
 use tower::ServiceExt;
 
-async fn setup() -> (SqlitePool, axum::Router) {
+async fn setup() -> (SqlitePool, axum::Router, std::path::PathBuf) {
+    let path = std::env::temp_dir().join(format!("relaybox-{}.db", uuid::Uuid::new_v4()));
+    let options = SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(true);
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect("sqlite::memory:")
+        .connect_with(options)
         .await
         .unwrap();
     let app = relaybox::app(pool.clone()).await.unwrap();
-    (pool, app)
+    (pool, app, path)
 }
 
 async fn request(
@@ -43,7 +51,17 @@ async fn request(
 
 #[tokio::test]
 async fn enqueue_replay_conflict_and_query_are_durable() {
-    let (pool, app) = setup().await;
+    let path = std::env::temp_dir().join(format!("relaybox-{}.db", uuid::Uuid::new_v4()));
+    let database_url = format!("sqlite://{}", path.display());
+    let options = SqliteConnectOptions::from_str(&database_url)
+        .unwrap()
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    let app = relaybox::app(pool.clone()).await.unwrap();
     let input = json!({"target_url":"https://example.test/webhooks","payload":{"a":1,"b":2}});
     let (status, created) = request(
         &app,
@@ -73,7 +91,13 @@ async fn enqueue_replay_conflict_and_query_are_durable() {
     assert_eq!(conflict["error"]["code"], "idempotency_conflict");
 
     drop(app);
-    let restarted = relaybox::app(pool).await.unwrap();
+    pool.close().await;
+    let restarted_pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let restarted = relaybox::app(restarted_pool.clone()).await.unwrap();
     let (status, queried) = request(
         &restarted,
         "GET",
@@ -84,11 +108,13 @@ async fn enqueue_replay_conflict_and_query_are_durable() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(queried, created);
+    restarted_pool.close().await;
+    std::fs::remove_file(path).unwrap();
 }
 
 #[tokio::test]
 async fn validates_requests_and_handles_concurrent_same_key() {
-    let (_, app) = setup().await;
+    let (pool, app, path) = setup().await;
     let (status, _) = request(
         &app,
         "POST",
@@ -107,9 +133,43 @@ async fn validates_requests_and_handles_concurrent_same_key() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let malformed_json = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/deliveries")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "malformed-json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(malformed_json.status(), StatusCode::BAD_REQUEST);
     assert_eq!(invalid_url["error"]["code"], "invalid_target_url");
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/v1/deliveries",
+        Some("typed-url"),
+        json!({"target_url":123,"payload":null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     let (status, _) = request(&app, "GET", "/v1/deliveries/not-a-uuid", None, json!(null)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    let malformed_path = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/deliveries/%FF")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(malformed_path.status(), StatusCode::NOT_FOUND);
     let health = app
         .clone()
         .oneshot(
@@ -149,4 +209,7 @@ async fn validates_requests_and_handles_concurrent_same_key() {
     }
     assert_eq!(created, 1);
     assert!(ids.iter().all(|id| id == &ids[0]));
+    drop(app);
+    pool.close().await;
+    std::fs::remove_file(path).unwrap();
 }
