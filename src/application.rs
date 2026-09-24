@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -16,13 +17,13 @@ pub enum ApplicationError {
 
 #[derive(Debug)]
 pub enum EnqueueOutcome {
-    Inserted(Delivery),
+    Inserted { id: Uuid, created_at: DateTime<Utc> },
     Existing(Delivery),
 }
 
 #[async_trait]
 pub trait DeliveryRepository: Send + Sync {
-    async fn enqueue(&self, delivery: NewDelivery) -> Result<EnqueueOutcome, ApplicationError>;
+    async fn enqueue(&self, delivery: &NewDelivery) -> Result<EnqueueOutcome, ApplicationError>;
     async fn get(&self, id: Uuid) -> Result<Option<Delivery>, ApplicationError>;
 }
 
@@ -42,18 +43,27 @@ impl DeliveryService {
         target_url: String,
         payload: Value,
     ) -> Result<(Delivery, bool), ApplicationError> {
-        let outcome = self
-            .repository
-            .enqueue(NewDelivery {
-                idempotency_key,
-                target_url: target_url.clone(),
-                payload: payload.clone(),
-            })
-            .await?;
+        let new_delivery = NewDelivery {
+            idempotency_key,
+            target_url,
+            payload,
+        };
+        let outcome = self.repository.enqueue(&new_delivery).await?;
         match outcome {
-            EnqueueOutcome::Inserted(delivery) => Ok((delivery, true)),
+            EnqueueOutcome::Inserted { id, created_at } => Ok((
+                Delivery {
+                    id,
+                    status: "pending".into(),
+                    attempts: 0,
+                    target_url: new_delivery.target_url,
+                    payload: new_delivery.payload,
+                    created_at,
+                },
+                true,
+            )),
             EnqueueOutcome::Existing(delivery)
-                if delivery.target_url == target_url && delivery.payload == payload =>
+                if delivery.target_url == new_delivery.target_url
+                    && delivery.payload == new_delivery.payload =>
             {
                 Ok((delivery, false))
             }

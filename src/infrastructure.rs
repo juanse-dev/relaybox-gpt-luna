@@ -27,7 +27,7 @@ impl SqliteDeliveryRepository {
 
 #[async_trait]
 impl DeliveryRepository for SqliteDeliveryRepository {
-    async fn enqueue(&self, new: NewDelivery) -> Result<EnqueueOutcome, ApplicationError> {
+    async fn enqueue(&self, new: &NewDelivery) -> Result<EnqueueOutcome, ApplicationError> {
         let id = Uuid::new_v4();
         let created_at = Utc::now();
         let payload = serde_json::to_string(&new.payload)
@@ -36,14 +36,7 @@ impl DeliveryRepository for SqliteDeliveryRepository {
             .bind(id.to_string()).bind(&new.idempotency_key).bind(&new.target_url).bind(payload).bind(created_at.to_rfc3339())
             .execute(&self.pool).await;
         match result {
-            Ok(_) => Ok(EnqueueOutcome::Inserted(Delivery {
-                id,
-                status: "pending".into(),
-                attempts: 0,
-                target_url: new.target_url,
-                payload: new.payload,
-                created_at,
-            })),
+            Ok(_) => Ok(EnqueueOutcome::Inserted { id, created_at }),
             Err(sqlx::Error::Database(error)) if error.is_unique_violation() => self
                 .by_key(&new.idempotency_key)
                 .await

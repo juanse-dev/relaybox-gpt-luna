@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    http::{Request, StatusCode},
+    http::{HeaderValue, Request, StatusCode},
 };
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -113,6 +113,45 @@ async fn enqueue_replay_conflict_and_query_are_durable() {
 }
 
 #[tokio::test]
+async fn preserves_large_json_numbers_and_utf8_idempotency_keys() {
+    let (pool, app, path) = setup().await;
+    let enqueue = |number: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/deliveries")
+            .header("content-type", "application/json")
+            .header(
+                "Idempotency-Key",
+                HeaderValue::from_bytes("café".as_bytes()).unwrap(),
+            )
+            .body(Body::from(format!(
+                "{{\"target_url\":\"https://example.test/\",\"payload\":{number}}}"
+            )))
+            .unwrap()
+    };
+    let created = app
+        .clone()
+        .oneshot(enqueue("18446744073709551616"))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let bytes = created.into_body().collect().await.unwrap().to_bytes();
+    let delivery: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(delivery["payload"].to_string(), "18446744073709551616");
+
+    let conflict = app
+        .clone()
+        .oneshot(enqueue("18446744073709551617"))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+    drop(app);
+    pool.close().await;
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
 async fn validates_requests_and_handles_concurrent_same_key() {
     let (pool, app, path) = setup().await;
     let (status, _) = request(
@@ -181,6 +220,28 @@ async fn validates_requests_and_handles_concurrent_same_key() {
         .await
         .unwrap();
     assert_eq!(health.status(), StatusCode::OK);
+
+    let oversized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/deliveries")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "oversized")
+                .body(Body::from(vec![b' '; 2 * 1024 * 1024 + 1]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        oversized.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    let error: Value =
+        serde_json::from_slice(&oversized.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(error["error"]["code"], "invalid_request");
 
     let app = std::sync::Arc::new(app);
     let mut requests = Vec::new();

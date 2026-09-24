@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{rejection::PathRejection, Path, State},
+    extract::{
+        rejection::{BytesRejection, PathRejection},
+        Path, State,
+    },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -29,9 +32,12 @@ async fn health() -> Json<Value> {
 async fn enqueue(
     State(service): State<Arc<DeliveryService>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    let key = match headers.get("Idempotency-Key").and_then(|v| v.to_str().ok()) {
+    let key = match headers
+        .get("Idempotency-Key")
+        .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
+    {
         Some(value) => value.trim_matches(|c: char| c.is_ascii_whitespace()),
         None => {
             return error(
@@ -48,7 +54,14 @@ async fn enqueue(
             "Idempotency-Key must be 1 to 128 bytes after trimming",
         );
     }
-    let request: Value = match serde_json::from_slice(&body) {
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) => {
+            let status = rejection.status();
+            return error(status, "invalid_request", "Request body could not be read");
+        }
+    };
+    let mut request: Value = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(_) => {
             return error(
@@ -58,21 +71,28 @@ async fn enqueue(
             )
         }
     };
-    let Some(target_url) = request.get("target_url").and_then(Value::as_str) else {
+    let Some(target_url) = request
+        .get("target_url")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_target_url",
             "target_url must be an absolute HTTP or HTTPS URL with a host",
         );
     };
-    let Some(payload) = request.get("payload") else {
+    let Some(payload) = request
+        .as_object_mut()
+        .and_then(|object| object.remove("payload"))
+    else {
         return error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "payload is required",
         );
     };
-    match Url::parse(target_url) {
+    match Url::parse(&target_url) {
         Ok(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => (),
         _ => {
             return error(
@@ -82,10 +102,7 @@ async fn enqueue(
             )
         }
     }
-    match service
-        .enqueue(key.to_owned(), target_url.to_owned(), payload.clone())
-        .await
-    {
+    match service.enqueue(key.to_owned(), target_url, payload).await {
         Ok((delivery, created)) => (
             if created {
                 StatusCode::CREATED
