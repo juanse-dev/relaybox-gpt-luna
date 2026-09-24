@@ -96,7 +96,7 @@ async fn enqueue(
         Ok(url)
             if matches!(url.scheme(), "http" | "https")
                 && url.host().is_some()
-                && has_nonempty_authority(&target_url) => {}
+                && has_nonempty_authority(&target_url, url.scheme()) => {}
         _ => {
             return error(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -131,8 +131,14 @@ async fn enqueue(
     }
 }
 
-fn has_nonempty_authority(target_url: &str) -> bool {
-    let Some((_, remainder)) = target_url.split_once("://") else {
+fn has_nonempty_authority(target_url: &str, scheme: &str) -> bool {
+    let Some((input_scheme, remainder)) = target_url.split_once(':') else {
+        return false;
+    };
+    if !input_scheme.eq_ignore_ascii_case(scheme) {
+        return false;
+    }
+    let Some(remainder) = remainder.strip_prefix("//") else {
         return false;
     };
     !remainder

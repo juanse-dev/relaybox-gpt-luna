@@ -182,6 +182,16 @@ async fn validates_requests_and_handles_concurrent_same_key() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(missing_host["error"]["code"], "invalid_target_url");
+    let (status, misplaced_authority) = request(
+        &app,
+        "POST",
+        "/v1/deliveries",
+        Some("misplaced-authority"),
+        json!({"target_url":"https:path://example.com","payload":null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(misplaced_authority["error"]["code"], "invalid_target_url");
     let malformed_json = app
         .clone()
         .oneshot(
